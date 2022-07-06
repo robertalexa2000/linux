@@ -89,6 +89,7 @@ struct xsk_umem_info {
 	struct xsk_umem *umem;
 	u32 num_frames;
 	u32 frame_headroom;
+	u32 tx_frame_headroom;
 	void *buffer;
 	u32 frame_size;
 	bool unaligned_mode;
