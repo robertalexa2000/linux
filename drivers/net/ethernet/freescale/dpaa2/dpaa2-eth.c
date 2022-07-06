@@ -1114,9 +1114,10 @@ static int dpaa2_eth_build_single_fd(struct dpaa2_eth_priv *priv,
  * This can be called either from dpaa2_eth_tx_conf() or on the error path of
  * dpaa2_eth_tx().
  */
-static void dpaa2_eth_free_tx_fd(struct dpaa2_eth_priv *priv,
-				 struct dpaa2_eth_fq *fq,
-				 const struct dpaa2_fd *fd, bool in_napi)
+void dpaa2_eth_free_tx_fd(struct dpaa2_eth_priv *priv,
+			  struct dpaa2_eth_channel *ch,
+			  struct dpaa2_eth_fq *fq,
+			  const struct dpaa2_fd *fd, bool in_napi)
 {
 	struct device *dev = priv->net_dev->dev.parent;
 	dma_addr_t fd_addr, sg_addr;
@@ -1143,7 +1144,8 @@ static void dpaa2_eth_free_tx_fd(struct dpaa2_eth_priv *priv,
 					 skb_tail_pointer(skb) - buffer_start,
 					 DMA_BIDIRECTIONAL);
 		} else {
-			WARN_ONCE(swa->type != DPAA2_ETH_SWA_XDP, "Wrong SWA type");
+			WARN_ONCE(swa->type != DPAA2_ETH_SWA_XDP && swa->type != DPAA2_ETH_SWA_XSK,
+				  "Wrong SWA type");
 			dma_unmap_single(dev, fd_addr, swa->xdp.dma_size,
 					 DMA_BIDIRECTIONAL);
 		}
@@ -1195,6 +1197,11 @@ static void dpaa2_eth_free_tx_fd(struct dpaa2_eth_priv *priv,
 		}
 	} else {
 		netdev_dbg(priv->net_dev, "Invalid FD format\n");
+		return;
+	}
+
+	if (swa->type == DPAA2_ETH_SWA_XSK) {
+		ch->xsk_frames_done++;
 		return;
 	}
 
@@ -1372,7 +1379,7 @@ err_alloc_tso_hdr:
 err_sgt_get:
 	/* Free all the other FDs that were already fully created */
 	for (i = 0; i < index; i++)
-		dpaa2_eth_free_tx_fd(priv, NULL, &fd_start[i], false);
+		dpaa2_eth_free_tx_fd(priv, NULL, NULL, &fd_start[i], false);
 
 	return err;
 }
@@ -1488,7 +1495,7 @@ static netdev_tx_t __dpaa2_eth_tx(struct sk_buff *skb,
 	if (unlikely(err < 0)) {
 		percpu_stats->tx_errors++;
 		/* Clean up everything, including freeing the skb */
-		dpaa2_eth_free_tx_fd(priv, fq, fd, false);
+		dpaa2_eth_free_tx_fd(priv, NULL, fq, fd, false);
 		netdev_tx_completed_queue(nq, 1, fd_len);
 	} else {
 		percpu_stats->tx_packets += total_enqueued;
@@ -1581,7 +1588,7 @@ static void dpaa2_eth_tx_conf(struct dpaa2_eth_priv *priv,
 
 	/* Check frame errors in the FD field */
 	fd_errors = dpaa2_fd_get_ctrl(fd) & DPAA2_FD_TX_ERR_MASK;
-	dpaa2_eth_free_tx_fd(priv, fq, fd, true);
+	dpaa2_eth_free_tx_fd(priv, ch, fq, fd, true);
 
 	if (likely(!fd_errors))
 		return;
@@ -1922,6 +1929,7 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
 	struct dpaa2_eth_fq *fq, *txc_fq = NULL;
 	struct netdev_queue *nq;
 	int store_cleaned, work_done;
+	bool work_done_zc = false;
 	struct list_head rx_list;
 	int retries = 0;
 	u16 flowid;
@@ -1931,6 +1939,11 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
 	ch->xdp.res = 0;
 	priv = ch->priv;
 
+	/* Tx ZC */
+	if (ch->xsk_zc)
+		work_done_zc = dpaa2_xsk_tx(priv, ch);
+
+	/* Rx or Tx conf slow path */
 	INIT_LIST_HEAD(&rx_list);
 	ch->rx_list = &rx_list;
 
@@ -1943,8 +1956,12 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
 		dpaa2_eth_refill_pool(priv, ch);
 
 		store_cleaned = dpaa2_eth_consume_frames(ch, &fq);
-		if (store_cleaned <= 0)
-			break;
+		if (store_cleaned <= 0) {
+			if (!work_done_zc)
+				break;
+			if (work_done_zc)
+				goto out;
+		}
 		if (fq->type == DPAA2_RX_FQ) {
 			rx_cleaned += store_cleaned;
 			flowid = fq->flowid;
@@ -1958,7 +1975,8 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
 		 * or we reached the Tx confirmations threshold, we're done.
 		 */
 		if (rx_cleaned >= budget ||
-		    txconf_cleaned >= DPAA2_ETH_TXCONF_PER_NAPI) {
+		    txconf_cleaned >= DPAA2_ETH_TXCONF_PER_NAPI ||
+		    work_done_zc) {
 			work_done = budget;
 			goto out;
 		}
@@ -1986,6 +2004,11 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
 out:
 	netif_receive_skb_list(ch->rx_list);
 
+	if (ch->xsk_pool && ch->xsk_frames_done) {
+		xsk_tx_completed(ch->xsk_pool, ch->xsk_frames_done);
+		ch->xsk_frames_done = 0;
+	}
+
 	if (txc_fq && txc_fq->dq_frames) {
 		nq = netdev_get_tx_queue(priv->net_dev, txc_fq->flowid);
 		netdev_tx_completed_queue(nq, txc_fq->dq_frames,
@@ -1999,7 +2022,7 @@ out:
 	else if (rx_cleaned && ch->xdp.res & XDP_TX)
 		dpaa2_eth_xdp_tx_flush(priv, ch, &priv->fq[flowid]);
 
-	return work_done;
+	return (!!work_done || work_done_zc) ? budget : work_done;
 }
 
 static void dpaa2_eth_enable_ch_napi(struct dpaa2_eth_priv *priv)
@@ -2991,7 +3014,11 @@ static void dpaa2_eth_cdan_cb(struct dpaa2_io_notification_ctx *ctx)
 	/* Update NAPI statistics */
 	ch->stats.cdan++;
 
-	napi_schedule(&ch->napi);
+	/* NAPI can also be scheduled from the AF_XDP Tx path. Mark a missed
+	 * so that it can be rescheduled again.
+	 */
+	if (!napi_if_scheduled_mark_missed(&ch->napi))
+		napi_schedule(&ch->napi);
 }
 
 /* Allocate and configure a DPCON object */
